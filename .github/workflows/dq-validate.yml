@@ -1,26 +1,17 @@
 name: Data Quality — DDL Validation
 
 on:
-  # Trigger on PRs that change changelogs (production use)
-  pull_request:
-    paths:
-      - 'changelogs/**'
-
-  # Also trigger on direct push so you can test without a PR
   push:
     paths:
       - 'changelogs/**'
-
-  # Allow manual trigger from GitHub Actions UI (Actions tab → Run workflow)
+  pull_request:
+    paths:
+      - 'changelogs/**'
   workflow_dispatch:
 
 concurrency:
   group: dq-validate-${{ github.ref }}
   cancel-in-progress: true
-
-defaults:
-  run:
-    shell: bash
 
 jobs:
   dq-validate:
@@ -34,57 +25,48 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Find changelogs to validate
-        id: changed
-        shell: bash
-        run: |
-          if [ "${{ github.event_name }}" = "pull_request" ]; then
-            CHANGED=$(git diff --name-only origin/${{ github.base_ref }}...HEAD \
-              | grep -E '^changelogs/.*\.(xml|sql)$' || true)
-          else
-            CHANGED=$(find changelogs -name "*.sql" -o -name "*.xml" 2>/dev/null || true)
-          fi
-
-          if [ -z "$CHANGED" ]; then
-            echo "No changelog files found."
-            echo "files=" >> $GITHUB_OUTPUT
-          else
-            echo "Changelogs to validate:"
-            echo "$CHANGED"
-            echo "files=$(echo $CHANGED | tr '\n' ' ')" >> $GITHUB_OUTPUT
-          fi
-
-      - name: Validate DDL against data quality rules
+      - name: Validate all changelogs
         id: validate
-        if: steps.changed.outputs.files != ''
-        shell: bash
+        shell: pwsh
         env:
-          DQ_URL:            ${{ secrets.DQ_URL || 'http://localhost:8000' }}
-          GITHUB_TOKEN:      ${{ secrets.GITHUB_TOKEN }}
+          DQ_URL: ${{ secrets.DQ_URL || 'http://localhost:8000' }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           GITHUB_REPOSITORY: ${{ github.repository }}
-          GITHUB_PR_NUMBER:  ${{ github.event.pull_request.number }}
+          GITHUB_PR_NUMBER: ${{ github.event.pull_request.number }}
         run: |
-          EXIT_CODE=0
+          $ErrorActionPreference = 'Continue'
+          $exitCode = 0
 
-          for CHANGELOG in ${{ steps.changed.outputs.files }}; do
-            echo "Validating: $CHANGELOG"
-            python ci/liquibase_validate.py \
-              --changelog "$CHANGELOG" \
-              --url "$DQ_URL" \
-              --fail-on critical high \
-              --soft-gate \
-              || EXIT_CODE=$?
-          done
+          # Find all changelog files
+          $changelogs = Get-ChildItem -Path "changelogs" -Recurse -Include "*.sql","*.xml" -ErrorAction SilentlyContinue
 
-          if [ $EXIT_CODE -eq 0 ]; then
-            echo "passed=true" >> $GITHUB_OUTPUT
-          else
-            echo "passed=false" >> $GITHUB_OUTPUT
-          fi
+          if ($changelogs.Count -eq 0) {
+            Write-Host "No changelog files found. Skipping."
+            "passed=true" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+            exit 0
+          }
 
+          Write-Host "Found $($changelogs.Count) changelog file(s) to validate"
+
+          foreach ($changelog in $changelogs) {
+            Write-Host "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+            Write-Host "Validating: $($changelog.FullName)"
+            Write-Host "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+
+            python ci/liquibase_validate.py `
+              --changelog "$($changelog.FullName)" `
+              --url "$env:DQ_URL" `
+              --fail-on critical high `
+              --soft-gate
+
+            if ($LASTEXITCODE -ne 0) { $exitCode = $LASTEXITCODE }
+          }
+
+          if ($exitCode -eq 0) {
+            "passed=true" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+          } else {
+            "passed=false" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+          }
+
+          # soft-gate: always exit 0
           exit 0
-
-      - name: No changelogs to validate
-        if: steps.changed.outputs.files == ''
-        shell: bash
-        run: echo "No changelog files found. Skipping."
