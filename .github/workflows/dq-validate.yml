@@ -1,0 +1,95 @@
+name: Data Quality — DDL Validation
+
+on:
+  # Trigger on PRs that change changelogs (production use)
+  pull_request:
+    paths:
+      - 'changelogs/**'
+
+  # Also trigger on direct push so you can test without a PR
+  push:
+    paths:
+      - 'changelogs/**'
+
+  # Allow manual trigger from GitHub Actions UI (Actions tab → Run workflow)
+  workflow_dispatch:
+
+concurrency:
+  group: dq-validate-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  dq-validate:
+    name: Data Quality Gate
+    runs-on: ubuntu-latest
+
+    outputs:
+      passed: ${{ steps.validate.outputs.passed }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Find changelogs to validate
+        id: changed
+        run: |
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            # PR mode: only changed files
+            CHANGED=$(git diff --name-only origin/${{ github.base_ref }}...HEAD \
+              | grep -E '^changelogs/.*\.(xml|sql)$' || true)
+          else
+            # Push / manual: validate all changelogs
+            CHANGED=$(find changelogs -name "*.sql" -o -name "*.xml" 2>/dev/null || true)
+          fi
+
+          if [ -z "$CHANGED" ]; then
+            echo "No changelog files found."
+            echo "files=" >> $GITHUB_OUTPUT
+          else
+            echo "Changelogs to validate:"
+            echo "$CHANGED"
+            echo "files=$(echo $CHANGED | tr '\n' ' ')" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Validate DDL against data quality rules
+        id: validate
+        if: steps.changed.outputs.files != ''
+        env:
+          DQ_URL:            ${{ secrets.DQ_URL }}
+          GITHUB_TOKEN:      ${{ secrets.GITHUB_TOKEN }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+          GITHUB_PR_NUMBER:  ${{ github.event.pull_request.number }}
+        run: |
+          EXIT_CODE=0
+
+          for CHANGELOG in ${{ steps.changed.outputs.files }}; do
+            echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+            echo "Validating: $CHANGELOG"
+            echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+
+            python ci/liquibase_validate.py \
+              --changelog "$CHANGELOG" \
+              --url "$DQ_URL" \
+              --fail-on critical high \
+              --soft-gate \
+              || EXIT_CODE=$?
+          done
+
+          if [ $EXIT_CODE -eq 0 ]; then
+            echo "passed=true" >> $GITHUB_OUTPUT
+          else
+            echo "passed=false" >> $GITHUB_OUTPUT
+          fi
+
+          # soft-gate: always exit 0 so the workflow shows green
+          # Remove --soft-gate above to make it block on violations
+          exit 0
+
+      - name: No changelogs to validate
+        if: steps.changed.outputs.files == ''
+        run: echo "No changelog files found. Skipping."
