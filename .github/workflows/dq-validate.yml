@@ -21,7 +21,7 @@ concurrency:
 jobs:
   dq-validate:
     name: Data Quality Gate
-    runs-on: ubuntu-latest
+    runs-on: self-hosted
 
     outputs:
       passed: ${{ steps.validate.outputs.passed }}
@@ -60,7 +60,7 @@ jobs:
         id: validate
         if: steps.changed.outputs.files != ''
         env:
-          DQ_URL:            ${{ secrets.DQ_URL }}
+          DQ_URL:            ${{ secrets.DQ_URL || 'http://localhost:8000' }}
           GITHUB_TOKEN:      ${{ secrets.GITHUB_TOKEN }}
           GITHUB_REPOSITORY: ${{ github.repository }}
           GITHUB_PR_NUMBER:  ${{ github.event.pull_request.number }}
