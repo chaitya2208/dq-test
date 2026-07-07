@@ -7,6 +7,9 @@ on:
   pull_request:
     paths:
       - 'changelogs/**'
+  # Re-run after developer adds /dq-approve comment
+  issue_comment:
+    types: [created]
   workflow_dispatch:
 
 concurrency:
@@ -17,6 +20,10 @@ jobs:
   dq-validate:
     name: Data Quality Gate
     runs-on: self-hosted
+    # Run on PR comments only if they contain /dq-approve
+    if: |
+      github.event_name != 'issue_comment' ||
+      contains(github.event.comment.body, '/dq-approve')
 
     outputs:
       passed: ${{ steps.validate.outputs.passed }}
@@ -25,19 +32,41 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Validate all changelogs
+      - name: Check for /dq-approve commands in PR comments
+        id: approvals
+        shell: powershell
+        env:
+          GITHUB_TOKEN:      ${{ secrets.GITHUB_TOKEN }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+          GITHUB_PR_NUMBER:  ${{ github.event.pull_request.number || github.event.issue.number }}
+        run: |
+          $result = python ci/check_approvals.py 2>&1
+          # Last line is the JSON, earlier lines are INFO messages
+          $lines = $result -split "`n"
+          $json = ($lines | Where-Object { $_.TrimStart().StartsWith('{') } | Select-Object -Last 1)
+          if (-not $json) { $json = '{"approve_all":false,"approved_rules":[]}' }
+
+          Write-Host "Approvals: $json"
+
+          $data = $json | ConvertFrom-Json
+          $approveAll = $data.approve_all
+          $approvedRules = ($data.approved_rules -join ' ')
+
+          "approve_all=$approveAll" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+          "approved_rules=$approvedRules" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+
+      - name: Validate DDL against data quality rules
         id: validate
         shell: powershell
         env:
-          DQ_URL: ${{ secrets.DQ_URL || 'http://localhost:8000' }}
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          DQ_URL:            ${{ secrets.DQ_URL || 'http://localhost:8000' }}
+          GITHUB_TOKEN:      ${{ secrets.GITHUB_TOKEN }}
           GITHUB_REPOSITORY: ${{ github.repository }}
-          GITHUB_PR_NUMBER: ${{ github.event.pull_request.number }}
+          GITHUB_PR_NUMBER:  ${{ github.event.pull_request.number || github.event.issue.number }}
         run: |
           $ErrorActionPreference = 'Continue'
           $exitCode = 0
 
-          # Find all changelog files
           $changelogs = Get-ChildItem -Path "changelogs" -Recurse -Include "*.sql","*.xml" -ErrorAction SilentlyContinue
 
           if ($changelogs.Count -eq 0) {
@@ -48,17 +77,30 @@ jobs:
 
           Write-Host "Found $($changelogs.Count) changelog file(s) to validate"
 
+          # Build approval flags
+          $approvalFlags = @()
+          if ("${{ steps.approvals.outputs.approve_all }}" -eq "True") {
+            $approvalFlags += "--approve-all"
+            Write-Host "NOTE: approve-all is set — violations will only warn"
+          }
+          $approvedRules = "${{ steps.approvals.outputs.approved_rules }}".Trim()
+          if ($approvedRules -ne "") {
+            $ruleList = $approvedRules -split '\s+'
+            $approvalFlags += "--approved-rules"
+            $approvalFlags += $ruleList
+          }
+
           foreach ($changelog in $changelogs) {
-            Write-Host "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
             Write-Host "Validating: $($changelog.FullName)"
-            Write-Host "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
 
-            python ci/liquibase_validate.py `
-              --changelog "$($changelog.FullName)" `
-              --url "$env:DQ_URL" `
-              --fail-on critical high `
-              --soft-gate
+            $args = @(
+              "ci/liquibase_validate.py",
+              "--changelog", $changelog.FullName,
+              "--url", $env:DQ_URL,
+              "--fail-on", "critical", "high"
+            ) + $approvalFlags
 
+            python @args
             if ($LASTEXITCODE -ne 0) { $exitCode = $LASTEXITCODE }
           }
 
@@ -68,5 +110,4 @@ jobs:
             "passed=false" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
           }
 
-          # soft-gate: always exit 0
-          exit 0
+          exit $exitCode
