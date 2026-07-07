@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# -*- coding: utf-8 -*-
 """
 liquibase_validate.py — Data Quality gate for Liquibase + GitHub Actions
 
@@ -32,6 +33,12 @@ import urllib.request
 import urllib.error
 from typing import List, Dict
 
+# Force UTF-8 output — Windows console defaults to cp1252 which breaks emojis
+if hasattr(sys.stdout, 'reconfigure'):
+    sys.stdout.reconfigure(encoding='utf-8', errors='replace')
+if hasattr(sys.stderr, 'reconfigure'):
+    sys.stderr.reconfigure(encoding='utf-8', errors='replace')
+
 # ── Colour helpers ────────────────────────────────────────────────────────────
 
 _TTY = sys.stdout.isatty()
@@ -42,11 +49,11 @@ BOLD   = "\033[1m"  if _TTY else ""
 RESET  = "\033[0m"  if _TTY else ""
 
 SEV_EMOJI = {
-    "critical": "🔴",
-    "high":     "🟠",
-    "medium":   "🟡",
-    "low":      "🔵",
-    "info":     "⚪",
+    "critical": "[CRITICAL]",
+    "high":     "[HIGH]",
+    "medium":   "[MEDIUM]",
+    "low":      "[LOW]",
+    "info":     "[INFO]",
 }
 
 # ── API call ──────────────────────────────────────────────────────────────────
@@ -292,7 +299,7 @@ def main() -> None:
         print("Nothing to validate — exiting 0.")
         sys.exit(0)
 
-    print(f"Found {len(tables)} CREATE TABLE statement(s). Validating against {args.url}…")
+    print(f"Found {len(tables)} CREATE TABLE statement(s). Validating against {args.url}...")
 
     # Validate each table
     all_results = []
@@ -300,7 +307,7 @@ def main() -> None:
 
     for t in tables:
         cs_label = f"[{t['changeset_id']}]" if t.get("changeset_id") else ""
-        print(f"  Validating {t['table_name']} {cs_label}…", end=" ", flush=True)
+        print(f"  Validating {t['table_name']} {cs_label}...", end=" ", flush=True)
 
         result = call_validate_api(args.url, t["sql"], fail_on)
         blocked = result.get("blocked_by", 0)
@@ -317,9 +324,9 @@ def main() -> None:
     # Print summary to stdout
     print()
     if total_blocked == 0:
-        print(f"{GREEN}{BOLD}✓ All tables passed data quality validation{RESET}")
+        print(f"{GREEN}{BOLD}PASSED: All tables passed data quality validation{RESET}")
     else:
-        print(f"{RED}{BOLD}✗ {total_blocked} blocking violation(s) found{RESET}")
+        print(f"{RED}{BOLD}FAILED: {total_blocked} blocking violation(s) found{RESET}")
         for r in all_results:
             if r["blocked_by"] > 0:
                 for f in r["findings"]:
@@ -331,7 +338,7 @@ def main() -> None:
     if not args.no_comment:
         comment = build_pr_comment(all_results, fail_on, args.soft_gate)
         print()
-        print("Posting GitHub PR comment…")
+        print("Posting GitHub PR comment...")
         post_github_comment(comment)
 
         # Request review (blocks PR) if hard gate and violations found
