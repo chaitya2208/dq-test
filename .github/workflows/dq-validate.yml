@@ -18,6 +18,10 @@ concurrency:
   group: dq-validate-${{ github.ref }}
   cancel-in-progress: true
 
+defaults:
+  run:
+    shell: bash
+
 jobs:
   dq-validate:
     name: Data Quality Gate
@@ -32,13 +36,12 @@ jobs:
 
       - name: Find changelogs to validate
         id: changed
+        shell: bash
         run: |
           if [ "${{ github.event_name }}" = "pull_request" ]; then
-            # PR mode: only changed files
             CHANGED=$(git diff --name-only origin/${{ github.base_ref }}...HEAD \
               | grep -E '^changelogs/.*\.(xml|sql)$' || true)
           else
-            # Push / manual: validate all changelogs
             CHANGED=$(find changelogs -name "*.sql" -o -name "*.xml" 2>/dev/null || true)
           fi
 
@@ -54,6 +57,7 @@ jobs:
       - name: Validate DDL against data quality rules
         id: validate
         if: steps.changed.outputs.files != ''
+        shell: bash
         env:
           DQ_URL:            ${{ secrets.DQ_URL || 'http://localhost:8000' }}
           GITHUB_TOKEN:      ${{ secrets.GITHUB_TOKEN }}
@@ -63,10 +67,7 @@ jobs:
           EXIT_CODE=0
 
           for CHANGELOG in ${{ steps.changed.outputs.files }}; do
-            echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
             echo "Validating: $CHANGELOG"
-            echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-
             python ci/liquibase_validate.py \
               --changelog "$CHANGELOG" \
               --url "$DQ_URL" \
@@ -81,10 +82,9 @@ jobs:
             echo "passed=false" >> $GITHUB_OUTPUT
           fi
 
-          # soft-gate: always exit 0 so the workflow shows green
-          # Remove --soft-gate above to make it block on violations
           exit 0
 
       - name: No changelogs to validate
         if: steps.changed.outputs.files == ''
+        shell: bash
         run: echo "No changelog files found. Skipping."
