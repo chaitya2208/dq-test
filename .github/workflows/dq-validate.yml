@@ -1,19 +1,23 @@
-# Data Quality — Shift-Left DDL Validation (SOFT / pass-fail only)
+# Data Quality - Shift-Left DDL Validation (SOFT / pass-fail only)
 #
 # On every push or PR that changes a changelog, validate each CREATE TABLE
 # against the Data Quality Platform backend and report pass/fail in the
 # Checks tab + job summary. SOFT MODE: never fails the job, so a PR is never
-# blocked — findings are informational for now.
+# blocked -- findings are informational for now.
 #
 # Requirements while this runs (all on the self-hosted runner's machine):
 #   1. Backend running at localhost:8000 (Snowflake SSO already done)
-#   2. Self-hosted runner running:  cd C:\Users\cshah\actions-runner && ./run.cmd
+#   2. Self-hosted runner running:  cd C:\Users\cshah\actions-runner ; ./run.cmd
 #
 # The runner is Windows, so run steps use shell: powershell.
-# NOTE: validate_ddl.py validates ONE CREATE TABLE per file — keep one table
+# IMPORTANT: keep this script ASCII-only. The Windows runner reads the YAML as
+# cp1252, so any Unicode (em-dash, checkmarks, box-drawing) turns into mojibake
+# that breaks PowerShell string quoting and fails the whole job at parse time.
+#
+# NOTE: validate_ddl.py validates ONE CREATE TABLE per file -- keep one table
 # per changelog file (see changelogs/v1_orders.sql, v2_customers.sql).
 
-name: Data Quality — DDL Validation (soft)
+name: Data Quality - DDL Validation (soft)
 
 on:
   push:
@@ -47,33 +51,33 @@ jobs:
 
           $files = Get-ChildItem -Path "changelogs" -Recurse -Include "*.sql" -ErrorAction SilentlyContinue
           if ($files.Count -eq 0) {
-            "No .sql changelogs found — nothing to validate." | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append
+            "No .sql changelogs found - nothing to validate." | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append
             exit 0
           }
 
-          "## Data Quality — DDL Validation (soft)" | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append
+          "## Data Quality - DDL Validation (soft)" | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append
           "" | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append
 
           $anyBlocking = $false
           foreach ($f in $files) {
-            Write-Host "──────────────────────────────────────────────"
+            Write-Host "----------------------------------------------"
             Write-Host "Validating: $($f.Name)"
             # --allow-offline: warn (not error) if the backend is unreachable.
             # Malformed SQL still reports a failure.
             python ci/validate_ddl.py --sql $f.FullName --url $dqUrl --fail-on critical high --allow-offline
             if ($LASTEXITCODE -ne 0) {
               $anyBlocking = $true
-              "- ❌ ``$($f.Name)`` — blocking findings (see logs)" | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append
+              "- [FAIL] ``$($f.Name)`` - blocking findings (see logs)" | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append
             } else {
-              "- ✅ ``$($f.Name)`` — passed" | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append
+              "- [PASS] ``$($f.Name)`` - passed" | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append
             }
           }
 
           "" | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append
           if ($anyBlocking) {
-            "⚠ **Blocking findings reported (soft mode — PR not blocked).**" | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append
+            "WARNING: Blocking findings reported (soft mode - PR not blocked)." | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append
           } else {
-            "✓ **All changed DDL passed.**" | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append
+            "OK: All changed DDL passed." | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append
           }
 
           # SOFT MODE: always succeed.
