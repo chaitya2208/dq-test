@@ -104,12 +104,44 @@ def build_comment(results, fail_on):
     return "\n".join(lines)
 
 
+def _resolve_pr_number(repo, token):
+    """Find the open PR number for this run.
+
+    On pull_request events GITHUB_PR_NUMBER is set directly. On push events it
+    is empty, so fall back to querying the open PR whose head branch matches
+    this ref -- GITHUB_HEAD_REF (PR events) or GITHUB_REF_NAME (push events).
+    Returns a PR number string, or None if none is open for the branch.
+    """
+    direct = os.environ.get("GITHUB_PR_NUMBER")
+    if direct:
+        return direct
+
+    branch = os.environ.get("GITHUB_HEAD_REF") or os.environ.get("GITHUB_REF_NAME")
+    if not (branch and repo and token):
+        return None
+
+    owner = repo.split("/")[0]
+    # head must be qualified as owner:branch for the pulls list filter.
+    url = ("https://api.github.com/repos/{}/pulls"
+           "?state=open&head={}:{}".format(repo, owner, branch))
+    try:
+        prs = _api("GET", url, token)
+    except Exception as e:  # never fail the soft job over a lookup
+        print("[post_findings] PR lookup failed: {}".format(e), file=sys.stderr)
+        return None
+    if isinstance(prs, list) and prs:
+        return str(prs[0].get("number"))
+    print("[post_findings] No open PR found for branch '{}'.".format(branch),
+          file=sys.stderr)
+    return None
+
+
 def upsert_comment(body):
     token = os.environ.get("GITHUB_TOKEN")
     repo = os.environ.get("GITHUB_REPOSITORY")
-    pr = os.environ.get("GITHUB_PR_NUMBER")
+    pr = _resolve_pr_number(repo, token)
     if not (token and repo and pr):
-        print("[post_findings] Missing GITHUB_TOKEN/REPOSITORY/PR_NUMBER -- "
+        print("[post_findings] No token/repo/PR resolved -- "
               "printing comment to log instead:\n", file=sys.stderr)
         print(body, file=sys.stderr)
         return
