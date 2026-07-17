@@ -159,6 +159,14 @@ def main() -> None:
              "developers who don't have the backend running aren't blocked. "
              "Malformed SQL still fails regardless of this flag.",
     )
+    parser.add_argument(
+        "--json", action="store_true",
+        help="Emit the raw validation result as a single line of JSON to "
+             "stdout (instead of the human-readable table). The JSON gets a "
+             "'source_file' field added so callers can attribute findings. "
+             "Use in CI to build PR comments / annotations. Exit code is "
+             "unchanged (0 pass / 1 blocking).",
+    )
     args = parser.parse_args()
 
     # Read SQL
@@ -182,7 +190,10 @@ def main() -> None:
 
     fail_on = [s.lower() for s in args.fail_on]
 
-    print(f"Validating DDL against {args.url} …")
+    # In --json mode this progress line must NOT pollute stdout (the caller
+    # parses stdout as JSON), so route it to stderr.
+    print(f"Validating DDL against {args.url} …",
+          file=sys.stderr if args.json else sys.stdout)
 
     try:
         result = call_api(args.url, sql, fail_on)
@@ -196,6 +207,13 @@ def main() -> None:
             sys.exit(0)
         print(f"{RED}ERROR{RESET} {msg}", file=sys.stderr)
         sys.exit(1)
+
+    # Machine-readable path: emit the raw result (annotated with the source
+    # file) and exit. CI uses this to build PR comments / annotations.
+    if args.json:
+        result["source_file"] = args.sql or "<stdin>"
+        print(json.dumps(result))
+        sys.exit(0 if result.get("passed", False) else 1)
 
     table      = result.get("table_name", "UNKNOWN")
     cols       = result.get("columns_parsed", 0)
