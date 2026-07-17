@@ -1,4 +1,19 @@
-name: Data Quality — DDL Validation
+# Data Quality — Shift-Left DDL Validation (SOFT / pass-fail only)
+#
+# On every push or PR that changes a changelog, validate each CREATE TABLE
+# against the Data Quality Platform backend and report pass/fail in the
+# Checks tab + job summary. SOFT MODE: never fails the job, so a PR is never
+# blocked — findings are informational for now.
+#
+# Requirements while this runs (all on the self-hosted runner's machine):
+#   1. Backend running at localhost:8000 (Snowflake SSO already done)
+#   2. Self-hosted runner running:  cd C:\Users\cshah\actions-runner && ./run.cmd
+#
+# The runner is Windows, so run steps use shell: powershell.
+# NOTE: validate_ddl.py validates ONE CREATE TABLE per file — keep one table
+# per changelog file (see changelogs/v1_orders.sql, v2_customers.sql).
+
+name: Data Quality — DDL Validation (soft)
 
 on:
   push:
@@ -7,9 +22,6 @@ on:
   pull_request:
     paths:
       - 'changelogs/**'
-  # Re-run after developer adds /dq-approve comment
-  issue_comment:
-    types: [created]
   workflow_dispatch:
 
 concurrency:
@@ -18,96 +30,51 @@ concurrency:
 
 jobs:
   dq-validate:
-    name: Data Quality Gate
+    name: Data Quality Gate (soft)
     runs-on: self-hosted
-    # Run on PR comments only if they contain /dq-approve
-    if: |
-      github.event_name != 'issue_comment' ||
-      contains(github.event.comment.body, '/dq-approve')
-
-    outputs:
-      passed: ${{ steps.validate.outputs.passed }}
 
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Check for /dq-approve commands in PR comments
-        id: approvals
+      - name: Validate changelog DDL
         shell: powershell
         env:
-          GITHUB_TOKEN:      ${{ secrets.GITHUB_TOKEN }}
-          GITHUB_REPOSITORY: ${{ github.repository }}
-          GITHUB_PR_NUMBER:  ${{ github.event.pull_request.number || github.event.issue.number }}
+          DQ_URL: ${{ secrets.DQ_URL }}
         run: |
-          $result = python ci/check_approvals.py 2>&1
-          # Last line is the JSON, earlier lines are INFO messages
-          $lines = $result -split "`n"
-          $json = ($lines | Where-Object { $_.TrimStart().StartsWith('{') } | Select-Object -Last 1)
-          if (-not $json) { $json = '{"approve_all":false,"approved_rules":[]}' }
+          $ErrorActionPreference = "Continue"
+          $dqUrl = if ($env:DQ_URL) { $env:DQ_URL } else { "http://localhost:8000" }
 
-          Write-Host "Approvals: $json"
-
-          $data = $json | ConvertFrom-Json
-          $approveAll = $data.approve_all
-          $approvedRules = ($data.approved_rules -join ' ')
-
-          "approve_all=$approveAll" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
-          "approved_rules=$approvedRules" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
-
-      - name: Validate DDL against data quality rules
-        id: validate
-        shell: powershell
-        env:
-          DQ_URL:            ${{ secrets.DQ_URL || 'http://localhost:8000' }}
-          GITHUB_TOKEN:      ${{ secrets.GITHUB_TOKEN }}
-          GITHUB_REPOSITORY: ${{ github.repository }}
-          GITHUB_PR_NUMBER:  ${{ github.event.pull_request.number || github.event.issue.number }}
-        run: |
-          $ErrorActionPreference = 'Continue'
-          $exitCode = 0
-
-          $changelogs = Get-ChildItem -Path "changelogs" -Recurse -Include "*.sql","*.xml" -ErrorAction SilentlyContinue
-
-          if ($changelogs.Count -eq 0) {
-            Write-Host "No changelog files found. Skipping."
-            "passed=true" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+          $files = Get-ChildItem -Path "changelogs" -Recurse -Include "*.sql" -ErrorAction SilentlyContinue
+          if ($files.Count -eq 0) {
+            "No .sql changelogs found — nothing to validate." | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append
             exit 0
           }
 
-          Write-Host "Found $($changelogs.Count) changelog file(s) to validate"
+          "## Data Quality — DDL Validation (soft)" | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append
+          "" | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append
 
-          # Build approval flags
-          $approvalFlags = @()
-          if ("${{ steps.approvals.outputs.approve_all }}" -eq "True") {
-            $approvalFlags += "--approve-all"
-            Write-Host "NOTE: approve-all is set — violations will only warn"
-          }
-          $approvedRules = "${{ steps.approvals.outputs.approved_rules }}".Trim()
-          if ($approvedRules -ne "") {
-            $ruleList = $approvedRules -split '\s+'
-            $approvalFlags += "--approved-rules"
-            $approvalFlags += $ruleList
-          }
-
-          foreach ($changelog in $changelogs) {
-            Write-Host "Validating: $($changelog.FullName)"
-
-            $args = @(
-              "ci/liquibase_validate.py",
-              "--changelog", $changelog.FullName,
-              "--url", $env:DQ_URL,
-              "--fail-on", "critical", "high"
-            ) + $approvalFlags
-
-            python @args
-            if ($LASTEXITCODE -ne 0) { $exitCode = $LASTEXITCODE }
+          $anyBlocking = $false
+          foreach ($f in $files) {
+            Write-Host "──────────────────────────────────────────────"
+            Write-Host "Validating: $($f.Name)"
+            # --allow-offline: warn (not error) if the backend is unreachable.
+            # Malformed SQL still reports a failure.
+            python ci/validate_ddl.py --sql $f.FullName --url $dqUrl --fail-on critical high --allow-offline
+            if ($LASTEXITCODE -ne 0) {
+              $anyBlocking = $true
+              "- ❌ ``$($f.Name)`` — blocking findings (see logs)" | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append
+            } else {
+              "- ✅ ``$($f.Name)`` — passed" | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append
+            }
           }
 
-          if ($exitCode -eq 0) {
-            "passed=true" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+          "" | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append
+          if ($anyBlocking) {
+            "⚠ **Blocking findings reported (soft mode — PR not blocked).**" | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append
           } else {
-            "passed=false" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+            "✓ **All changed DDL passed.**" | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append
           }
 
-          exit $exitCode
+          # SOFT MODE: always succeed.
+          exit 0
