@@ -57,7 +57,11 @@ jobs:
           DQ_URL: ${{ secrets.DQ_URL }}
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           GITHUB_REPOSITORY: ${{ github.repository }}
+          # On pull_request events this is the PR number; on push events it is
+          # empty and post_findings_comment.py resolves it from the branch.
           GITHUB_PR_NUMBER: ${{ github.event.pull_request.number }}
+          GITHUB_HEAD_REF: ${{ github.head_ref }}
+          GITHUB_REF_NAME: ${{ github.ref_name }}
         run: |
           $ErrorActionPreference = "Continue"
           $dqUrl = if ($env:DQ_URL) { $env:DQ_URL } else { "http://localhost:8000" }
@@ -105,13 +109,12 @@ jobs:
             }
           }
 
-          # Persist results and post/update the PR comment (only on PRs).
+          # Persist results and post/update the PR comment. The poster resolves
+          # the PR number from GITHUB_PR_NUMBER (pull_request events) or from the
+          # branch via the API (push events), so this runs on any trigger; it
+          # no-ops harmlessly if the branch has no open PR.
           $results | ConvertTo-Json -Depth 6 | Out-File -FilePath "dq_results.json" -Encoding utf8
-          if ($env:GITHUB_PR_NUMBER) {
-            python ci/post_findings_comment.py --results dq_results.json --fail-on critical high
-          } else {
-            Write-Host "Not a PR event - skipping PR comment."
-          }
+          python ci/post_findings_comment.py --results dq_results.json --fail-on critical high
 
           "" | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append
           if ($anyBlocking) {
