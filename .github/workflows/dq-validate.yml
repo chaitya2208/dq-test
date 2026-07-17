@@ -1,4 +1,28 @@
-name: Data Quality — DDL Validation
+# Data Quality - Shift-Left DDL Validation (ADVISORY / soft)
+#
+# On every push or PR that changes a changelog, validate each CREATE TABLE
+# against the Data Quality Platform backend. Findings are surfaced THREE ways
+# so they are impossible to miss even though the check stays green:
+#   1. A PR comment (upserted) listing every finding      <- main visibility
+#   2. GitHub ::warning:: annotations on the run
+#   3. The job summary
+# SOFT / ADVISORY: the job always succeeds, so the merge is never blocked.
+# The reviewer decides to fix or accept before clicking merge.
+#
+# Requirements while this runs (on the self-hosted runner's machine):
+#   1. Backend running at localhost:8000 (Snowflake SSO already done)
+#   2. Self-hosted runner running:  cd C:\Users\cshah\actions-runner ; ./run.cmd
+#
+# The runner is Windows -> shell: powershell.
+# IMPORTANT: keep this file ASCII-only. The Windows runner reads YAML as cp1252;
+# any Unicode (em-dash, checkmarks) becomes mojibake that breaks PowerShell
+# quoting and fails the job at parse time. Emoji/box-drawing belong only in the
+# Python CLI's own output (it reconfigures stdout to UTF-8), never here.
+#
+# NOTE: validate_ddl.py validates ONE CREATE TABLE per file -- one table per
+# changelog file (matches the Liquibase one-file-per-table convention).
+
+name: Data Quality - DDL Validation (advisory)
 
 on:
   push:
@@ -7,107 +31,94 @@ on:
   pull_request:
     paths:
       - 'changelogs/**'
-  # Re-run after developer adds /dq-approve comment
-  issue_comment:
-    types: [created]
   workflow_dispatch:
 
 concurrency:
   group: dq-validate-${{ github.ref }}
   cancel-in-progress: true
 
+# Needed so the workflow can post/update the findings PR comment.
+permissions:
+  contents: read
+  pull-requests: write
+
 jobs:
   dq-validate:
-    name: Data Quality Gate
+    name: Data Quality Gate (advisory)
     runs-on: self-hosted
-    # Run on PR comments only if they contain /dq-approve
-    if: |
-      github.event_name != 'issue_comment' ||
-      contains(github.event.comment.body, '/dq-approve')
-
-    outputs:
-      passed: ${{ steps.validate.outputs.passed }}
 
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Check for /dq-approve commands in PR comments
-        id: approvals
+      - name: Validate changelog DDL
         shell: powershell
         env:
-          GITHUB_TOKEN:      ${{ secrets.GITHUB_TOKEN }}
+          DQ_URL: ${{ secrets.DQ_URL }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           GITHUB_REPOSITORY: ${{ github.repository }}
-          GITHUB_PR_NUMBER:  ${{ github.event.pull_request.number || github.event.issue.number }}
+          GITHUB_PR_NUMBER: ${{ github.event.pull_request.number }}
         run: |
-          $result = python ci/check_approvals.py 2>&1
-          # Last line is the JSON, earlier lines are INFO messages
-          $lines = $result -split "`n"
-          $json = ($lines | Where-Object { $_.TrimStart().StartsWith('{') } | Select-Object -Last 1)
-          if (-not $json) { $json = '{"approve_all":false,"approved_rules":[]}' }
+          $ErrorActionPreference = "Continue"
+          $dqUrl = if ($env:DQ_URL) { $env:DQ_URL } else { "http://localhost:8000" }
 
-          Write-Host "Approvals: $json"
-
-          $data = $json | ConvertFrom-Json
-          $approveAll = $data.approve_all
-          $approvedRules = ($data.approved_rules -join ' ')
-
-          "approve_all=$approveAll" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
-          "approved_rules=$approvedRules" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
-
-      - name: Validate DDL against data quality rules
-        id: validate
-        shell: powershell
-        env:
-          DQ_URL:            ${{ secrets.DQ_URL || 'http://localhost:8000' }}
-          GITHUB_TOKEN:      ${{ secrets.GITHUB_TOKEN }}
-          GITHUB_REPOSITORY: ${{ github.repository }}
-          GITHUB_PR_NUMBER:  ${{ github.event.pull_request.number || github.event.issue.number }}
-        run: |
-          $ErrorActionPreference = 'Continue'
-          $exitCode = 0
-
-          $changelogs = Get-ChildItem -Path "changelogs" -Recurse -Include "*.sql","*.xml" -ErrorAction SilentlyContinue
-
-          if ($changelogs.Count -eq 0) {
-            Write-Host "No changelog files found. Skipping."
-            "passed=true" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+          $files = Get-ChildItem -Path "changelogs" -Recurse -Include "*.sql" -ErrorAction SilentlyContinue
+          if ($files.Count -eq 0) {
+            "No .sql changelogs found - nothing to validate." | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append
             exit 0
           }
 
-          Write-Host "Found $($changelogs.Count) changelog file(s) to validate"
+          "## Data Quality - DDL Validation (advisory)" | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append
+          "" | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append
 
-          # Build approval flags
-          $approvalFlags = @()
-          if ("${{ steps.approvals.outputs.approve_all }}" -eq "True") {
-            $approvalFlags += "--approve-all"
-            Write-Host "NOTE: approve-all is set — violations will only warn"
+          $results = @()
+          $anyBlocking = $false
+
+          foreach ($f in $files) {
+            Write-Host "----------------------------------------------"
+            Write-Host "Validating: $($f.Name)"
+
+            # Machine-readable result on stdout; progress noise on stderr.
+            $json = python ci/validate_ddl.py --sql $f.FullName --url $dqUrl --fail-on critical high --allow-offline --json
+            $rc = $LASTEXITCODE
+
+            if (-not $json) {
+              # Offline/unreachable: validate_ddl.py already warned. Skip file.
+              "- [SKIP] ``$($f.Name)`` - backend unreachable" | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append
+              continue
+            }
+
+            $obj = $json | ConvertFrom-Json
+            $results += $obj
+
+            # ::warning:: annotations -- one per finding, shown on the run.
+            foreach ($fn in $obj.findings) {
+              $col = if ($fn.column_name) { $fn.column_name } else { "-" }
+              Write-Host "::warning file=$($f.FullName),title=DQ $($fn.severity): $($fn.rule_code)::[$($f.Name)] $col - $($fn.title)"
+            }
+
+            if ($rc -ne 0) {
+              $anyBlocking = $true
+              "- [FINDINGS] ``$($f.Name)`` - $($obj.blocked_by) at/above threshold, $($obj.findings_count) total" | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append
+            } else {
+              "- [OK] ``$($f.Name)`` - no blocking findings" | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append
+            }
           }
-          $approvedRules = "${{ steps.approvals.outputs.approved_rules }}".Trim()
-          if ($approvedRules -ne "") {
-            $ruleList = $approvedRules -split '\s+'
-            $approvalFlags += "--approved-rules"
-            $approvalFlags += $ruleList
-          }
 
-          foreach ($changelog in $changelogs) {
-            Write-Host "Validating: $($changelog.FullName)"
-
-            $args = @(
-              "ci/liquibase_validate.py",
-              "--changelog", $changelog.FullName,
-              "--url", $env:DQ_URL,
-              "--fail-on", "critical", "high"
-            ) + $approvalFlags
-
-            python @args
-            if ($LASTEXITCODE -ne 0) { $exitCode = $LASTEXITCODE }
-          }
-
-          if ($exitCode -eq 0) {
-            "passed=true" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+          # Persist results and post/update the PR comment (only on PRs).
+          $results | ConvertTo-Json -Depth 6 | Out-File -FilePath "dq_results.json" -Encoding utf8
+          if ($env:GITHUB_PR_NUMBER) {
+            python ci/post_findings_comment.py --results dq_results.json --fail-on critical high
           } else {
-            "passed=false" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+            Write-Host "Not a PR event - skipping PR comment."
           }
 
-          exit $exitCode
+          "" | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append
+          if ($anyBlocking) {
+            "WARNING: Findings reported above (advisory - PR not blocked). Review before merging." | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append
+          } else {
+            "OK: All changed DDL passed." | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append
+          }
+
+          # ADVISORY: always succeed.
+          exit 0
