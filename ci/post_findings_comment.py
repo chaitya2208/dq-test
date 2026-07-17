@@ -175,7 +175,10 @@ def main():
     args = ap.parse_args()
 
     try:
-        with open(args.results, "r", encoding="utf-8") as fh:
+        # utf-8-sig strips a leading BOM. PowerShell's `Out-File -Encoding utf8`
+        # (which writes dq_results.json in the workflow) prepends a UTF-8 BOM
+        # that plain json.load rejects with "Unexpected UTF-8 BOM".
+        with open(args.results, "r", encoding="utf-8-sig") as fh:
             results = json.load(fh)
     except Exception as e:
         print("[post_findings] Could not read results: {}".format(e),
